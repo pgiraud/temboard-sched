@@ -3,6 +3,8 @@ import time
 import uuid
 import logging
 import json
+import os.path
+import types
 from select import select
 from datetime import datetime, timedelta
 from collections import deque
@@ -16,6 +18,7 @@ except ModuleNotFoundError:
     from queue import Empty
 
 TM_WORKERS = []
+TM_BOOTSTRAP = []
 
 # Message types
 MSG_TYPE_TASK_NEW = 0
@@ -60,7 +63,19 @@ def worker(pool_size=1):
     return defines_worker
 
 
-def schedule_task(worker_name, options=None, start=datetime.utcnow(),
+def bootstrap():
+    def defines_bootstrap(function):
+        global TM_BOOTSTRAP
+        TM_BOOTSTRAP.append({
+            'module': function.__module__,
+            'function': function.__name__
+        })
+        return function
+
+    return defines_bootstrap
+
+
+def schedule_task(worker_name, id=None, options=None, start=datetime.utcnow(),
                   redo_interval=None, listener_addr='/tmp/temboardsched.sock',
                   authkey=None):
     return TaskManager.send_message(
@@ -68,6 +83,7 @@ def schedule_task(worker_name, options=None, start=datetime.utcnow(),
                 Message(
                     MSG_TYPE_TASK_NEW,
                     Task(
+                        id=id,
                         worker_name=worker_name,
                         options=options,
                         start_datetime=start,
@@ -81,7 +97,7 @@ def schedule_task(worker_name, options=None, start=datetime.utcnow(),
 class Task(object):
 
     def __init__(self, worker_name=None, options=None, id=None,
-                 status=TASK_STATUS_DEFAULT, start_datetime=None,
+                 status=TASK_STATUS_DEFAULT, start_datetime=datetime.utcnow(),
                  redo_interval=None, stop_datetime=None, output=None):
         self.worker_name = worker_name
         self.options = options
@@ -137,6 +153,9 @@ class TaskList(object):
         if not self.path:
             return
 
+        if not os.path.exists(self.path):
+            return
+
         logger = logging.getLogger()
 
         with open(self.path, 'r') as f:
@@ -174,7 +193,10 @@ class TaskList(object):
 
     def push(self, t):
         # Add a new task to the list
-        t.id = self._gen_task_id()
+        if not t.id:
+            t.id = self._gen_task_id()
+        if t.id in self.tasks:
+            raise KeyError("Task with id=%s already present" % t.id)
         self.tasks[t.id] = t
         # Save task list on disk
         self._backup()
@@ -297,6 +319,27 @@ class Scheduler(object):
         # recover tasks from on disk image
         self.task_list.recover()
 
+        # bootstrap
+        for bs_func in TM_BOOTSTRAP:
+            func = getattr(sys.modules[bs_func['module']],
+                           bs_func['function'])()
+            if isinstance(func, types.GeneratorType):
+                for t in func:
+                    if isinstance(t, Task):
+                        try:
+                            self.task_list.push(t)
+                            self.logger.info('SCHED: Loaded bootstrap Task=%s'
+                                             % t)
+                        except KeyError:
+                            self.logger.error('SCHED: Task id=%s already '
+                                              'exists.' % t.id)
+                    else:
+                        self.logger.error('SCHED: bootstrap task not a Task '
+                                          'instance.')
+            else:
+                self.logger.error('SCHED: bootstrap function %s not a '
+                                  'generator.')
+
         timeout = 1
         t = timeout
         date_end = float(time.time()) + timeout
@@ -381,8 +424,12 @@ class Scheduler(object):
     def handle_message(self, message):
         if message.type == MSG_TYPE_TASK_NEW:
             # New task
-            task_id = self.task_list.push(message.content)
-            return Message(MSG_TYPE_RESP, {'id': task_id})
+            try:
+                task_id = self.task_list.push(message.content)
+                return Message(MSG_TYPE_RESP, {'id': task_id})
+            except KeyError:
+                return Message(MSG_TYPE_ERROR,
+                               {'error': 'Task id already exists'})
 
         elif message.type == MSG_TYPE_TASK_STATUS:
             # task status update
