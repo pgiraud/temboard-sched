@@ -1,0 +1,4 @@
+*.pyc
+build/
+dist/
+temboard_sched.egg-info/
