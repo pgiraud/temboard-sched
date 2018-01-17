@@ -2,6 +2,7 @@ import sys
 import time
 import uuid
 import logging
+import json
 from select import select
 from datetime import datetime, timedelta
 from collections import deque
@@ -35,6 +36,13 @@ TASK_STATUS_FAILED = 32
 TASK_STATUS_CANCELED = 64
 TASK_STATUS_ABORTED = 128
 TASK_STATUS_ABORT = 256
+
+
+def json_serial_datetime(obj):
+    # JSON serializer for datetime
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError("Type %s not serializable" % type(obj))
 
 
 def worker(pool_size=1):
@@ -74,15 +82,15 @@ class Task(object):
 
     def __init__(self, worker_name=None, options=None, id=None,
                  status=TASK_STATUS_DEFAULT, start_datetime=None,
-                 redo_interval=None):
+                 redo_interval=None, stop_datetime=None, output=None):
         self.worker_name = worker_name
         self.options = options
         self.status = status
         self.start_datetime = start_datetime
         self.redo_interval = redo_interval
-        self.stop_datetime = None
+        self.stop_datetime = stop_datetime
         self.id = id
-        self.output = None
+        self.output = output
 
     def __repr__(self):
         return str(self.__dict__)
@@ -104,16 +112,72 @@ class TaskList(object):
         self.path = path
         self.tasks = dict()
 
-    def save(self):
-        pass
+    def _backup(self):
+        if not self.path:
+            return
+        with open(self.path, 'w') as f:
+            for _, t in self.tasks.items():
+                try:
+                    f.write(
+                        json.dumps(
+                            t.__dict__,
+                            default=json_serial_datetime
+                        ) + '\n'
+                    )
+                except TypeError:
+                    # Could not serialize Task to JSON
+                    logger = logging.getLogger()
+                    logger.error("Could not serialize Task to JSON")
+                    logger.debug(t)
+                except Exception as e:
+                    logger = logging.getLogger()
+                    logger.error(str(e))
 
-    def load(self):
-        pass
+    def recover(self):
+        if not self.path:
+            return
+
+        logger = logging.getLogger()
+
+        with open(self.path, 'r') as f:
+            for l in f.readlines():
+                try:
+                    raw_dict = json.loads(l)
+                    t = Task(
+                            worker_name=raw_dict.get('worker_name'),
+                            options=raw_dict.get('options'),
+                            id=raw_dict.get('id'),
+                            status=raw_dict.get('status'),
+                            start_datetime=raw_dict.get('start_datetime'),
+                            stop_datetime=raw_dict.get('stop_datetime'),
+                            output=raw_dict.get('output'),
+                            redo_interval=raw_dict.get('redo_interval')
+                    )
+                    # Convert isoformat to datetime
+                    for a in ('start_datetime', 'stop_datetime'):
+                        if getattr(t, a):
+                            dt = datetime.strptime(getattr(t, a),
+                                                   "%Y-%m-%dT%H:%M:%S.%f")
+                            setattr(t, a, dt)
+
+                    if t.status & TASK_STATUS_DOING:
+                        # reset status & stop_datetime because the job was
+                        # running the last time task list was synced.
+                        t.status = TASK_STATUS_ABORTED
+                        t.stop_datetime = datetime.utcnow()
+
+                    logger.debug("SCHED: Recovered Task=%s" % t)
+                    self.push(t)
+                except Exception:
+                    logger.error("Could not unserialize Task from JSON")
+                    logger.debug(l)
 
     def push(self, t):
         # Add a new task to the list
         t.id = self._gen_task_id()
         self.tasks[t.id] = t
+        # Save task list on disk
+        self._backup()
         return t.id
 
     def get(self, task_id):
@@ -132,11 +196,15 @@ class TaskList(object):
                 raise Exception("Task attribute %s does not exist" % k)
             setattr(t, k, v)
         self.tasks[task_id] = t
+        # Save task list on disk
+        self._backup()
 
     def rm(self, task_id):
         if task_id not in self.tasks:
             raise Exception("Task id=%s not found" % task_id)
         del(self.tasks[task_id])
+        # Save task list on disk
+        self._backup()
 
     def _gen_task_id(self):
         id = None
@@ -225,6 +293,10 @@ class Scheduler(object):
         self.handle_message(message)
 
     def run(self):
+
+        # recover tasks from on disk image
+        self.task_list.recover()
+
         timeout = 1
         t = timeout
         date_end = float(time.time()) + timeout
