@@ -147,7 +147,7 @@ class TaskList(object):
                     logger.debug(t)
                 except Exception as e:
                     logger = logging.getLogger()
-                    logger.error(str(e))
+                    logger.exception(e)
 
     def recover(self):
         if not self.path:
@@ -187,9 +187,10 @@ class TaskList(object):
 
                     logger.debug("SCHED: Recovered Task=%s" % t)
                     self.push(t)
-                except Exception:
+                except Exception as e:
                     logger.error("Could not unserialize Task from JSON")
                     logger.debug(l)
+                    logger.exception(e)
 
     def push(self, t):
         # Add a new task to the list
@@ -288,7 +289,7 @@ class Scheduler(object):
         except Exception as e:
             conn.close()
             self.logger.error("SCHED: Unable to read the message")
-            self.logger.debug("SCHED: %s" % str(e))
+            self.logger.exception(e)
             return
 
         message.type = message.type[0]
@@ -554,6 +555,8 @@ class WorkerPool(object):
                         self._rm_task_worker_queue(t.id)
             except Empty:
                 pass
+            except Exception as e:
+                self.logger.exception(e)
             # check running jobs state
             self.check_jobs()
             # start new jobs
@@ -567,6 +570,7 @@ class WorkerPool(object):
             out.put(Message(MSG_TYPE_RESP, res))
         except Exception as e:
             out.put(Message(MSG_TYPE_ERROR, e))
+            self.logger.exception(e)
 
     def start_jobs(self):
         # Execute Tasks
