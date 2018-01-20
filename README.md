@@ -12,36 +12,34 @@ Minimal task scheduler.
 
 ``` python
 import time
-import logging
 
 from temboardsched import taskmanager
 
 
 @taskmanager.worker(pool_size=4)
-def sleep_worker(sleep):
-    time.sleep(sleep)
-    return 'Slept for %ss' % sleep
+def sleep_worker(duration, message):
+    time.sleep(duration)
+    return 'I say %s' % message
 
 
 @taskmanager.bootstrap()
-def sleep_bootstrap():
+def sleep_bootstrap(context):
     yield taskmanager.Task(
                 worker_name='sleep_worker',
                 id='sleep_1',
-                options={'sleep': 5},
+                options={
+                    'duration': 5,
+                    'message': context.get('message')
+                },
                 redo_interval=10
           )
 
 
 def main():
-    # setup a logger for debugging
-    logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG)
-    logger.addHandler(logging.StreamHandler())
-
-    # instanciate & start the task manager
-    task_manager = taskmanager.TaskManager()
-    task_manager.start()
+    # Instanciate & start the task manager
+    tm = taskmanager.TaskManager()
+    tm.set_context('message', 'Hi!')
+    tm.start()
 
 
 if __name__ == '__main__':

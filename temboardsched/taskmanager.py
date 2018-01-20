@@ -5,6 +5,7 @@ import logging
 import json
 import os.path
 import types
+import signal
 from select import select
 from datetime import datetime, timedelta
 from collections import deque
@@ -19,6 +20,10 @@ except ModuleNotFoundError:
 
 TM_WORKERS = []
 TM_BOOTSTRAP = []
+TM_SIGHUP = False
+TM_SIGTERM = False
+
+TM_DEF_LISTENER_ADDR = '/tmp/.temboardsched.sock'
 
 # Message types
 MSG_TYPE_TASK_NEW = 0
@@ -28,6 +33,7 @@ MSG_TYPE_TASK_ABORT = 3
 MSG_TYPE_TASK_LIST = 4
 MSG_TYPE_RESP = 5
 MSG_TYPE_ERROR = 6
+MSG_TYPE_CONTEXT = 7
 
 # Task status
 TASK_STATUS_DEFAULT = 1
@@ -63,6 +69,16 @@ def worker(pool_size=1):
     return defines_worker
 
 
+def handler_sigterm(num, frame):
+    global TM_SIGTERM
+    TM_SIGTERM = True
+
+
+def handler_sighup(num, frame):
+    global TM_SIGHUP
+    TM_SIGHUP = True
+
+
 def bootstrap():
     def defines_bootstrap(function):
         global TM_BOOTSTRAP
@@ -76,8 +92,9 @@ def bootstrap():
 
 
 def schedule_task(worker_name, id=None, options=None, start=datetime.utcnow(),
-                  redo_interval=None, listener_addr='/tmp/temboardsched.sock',
+                  redo_interval=None, listener_addr=TM_DEF_LISTENER_ADDR,
                   authkey=None):
+    # Schedule a new task
     return TaskManager.send_message(
                 listener_addr,
                 Message(
@@ -89,6 +106,18 @@ def schedule_task(worker_name, id=None, options=None, start=datetime.utcnow(),
                         start_datetime=start,
                         redo_interval=redo_interval,
                     )
+                ),
+                authkey=authkey
+           )
+
+
+def set_context(k, v, listener_addr=TM_DEF_LISTENER_ADDR, authkey=None):
+    # Update a context variable
+    return TaskManager.send_message(
+                listener_addr,
+                Message(
+                    MSG_TYPE_CONTEXT,
+                    {k: v}
                 ),
                 authkey=authkey
            )
@@ -238,7 +267,7 @@ class TaskList(object):
 
 class TaskManager(object):
 
-    def __init__(self, address='/tmp/temboardsched.sock', task_path=None,
+    def __init__(self, address=TM_DEF_LISTENER_ADDR, task_path=None,
                  authkey=None):
 
         self.scheduler = Scheduler(address, task_path, authkey)
@@ -248,6 +277,9 @@ class TaskManager(object):
                            )
         self.scheduler.logger = logging.getLogger()
         self.worker_pool.logger = logging.getLogger()
+
+    def set_context(self, key, val):
+        self.scheduler.set_context(key, val)
 
     def start(self):
         self.scheduler.start()
@@ -275,6 +307,13 @@ class Scheduler(object):
         # Queue used to notify Scheduler about Task status
         self.event_queue = Queue()
         self.task_list = TaskList(task_path)
+        self.context = dict()
+
+    def set_context(self, key, val):
+        self.context[key] = val
+
+    def get_context(self):
+        return self.context
 
     def handle_listener_message(self):
         # read message from the listener
@@ -315,15 +354,35 @@ class Scheduler(object):
         # handle incoming message
         self.handle_message(message)
 
-    def run(self):
-
-        # recover tasks from on disk image
-        self.task_list.recover()
-
-        # bootstrap
+    def sync_bootstrap_options(self):
+        # Reload bootstrap Task options and update Task from task_list with new
+        # options. This is usefull to reflect context changes into Task options
+        # like in a configuration update case.
         for bs_func in TM_BOOTSTRAP:
             func = getattr(sys.modules[bs_func['module']],
-                           bs_func['function'])()
+                           bs_func['function'])(context=self.get_context())
+            if isinstance(func, types.GeneratorType):
+                for t in func:
+                    if isinstance(t, Task):
+                        try:
+                            self.task_list.update(t.id, options=t.options)
+                        except Exception as e:
+                            self.logger.error('SCHED: Could not update task '
+                                              % t.id)
+                            self.logger.exception(e)
+                    else:
+                        self.logger.error('SCHED: bootstrap task not a Task '
+                                          'instance.')
+            else:
+                self.logger.error('SCHED: bootstrap function %s.%s not a '
+                                  'generator.'
+                                  % (bs_func['module'], bs_func['function']))
+
+    def bootstrap(self):
+        # Load Tasks from generators decorated by @taskmanager.bootstrap()
+        for bs_func in TM_BOOTSTRAP:
+            func = getattr(sys.modules[bs_func['module']],
+                           bs_func['function'])(context=self.get_context())
             if isinstance(func, types.GeneratorType):
                 for t in func:
                     if isinstance(t, Task):
@@ -338,8 +397,21 @@ class Scheduler(object):
                         self.logger.error('SCHED: bootstrap task not a Task '
                                           'instance.')
             else:
-                self.logger.error('SCHED: bootstrap function %s not a '
-                                  'generator.')
+                self.logger.error('SCHED: bootstrap function %s.%s not a '
+                                  'generator.'
+                                  % (bs_func['module'], bs_func['function']))
+
+    def run(self):
+        # Add signal handler
+        signal.signal(signal.SIGTERM, handler_sigterm)
+        signal.signal(signal.SIGHUP, handler_sighup)
+
+        # recover tasks from on disk image
+        self.task_list.recover()
+        # bootstrap
+        self.bootstrap()
+
+        global TM_SIGHUP
 
         timeout = 1
         t = timeout
@@ -373,6 +445,15 @@ class Scheduler(object):
                 self.logger.debug('SCHED: schedule')
                 # schedule Tasks & maintain Tasks list
                 self.schedule()
+
+                if TM_SIGTERM:
+                    self.logger.debug('SCHED: SIGTERM')
+                    # TODO: Ask WP to stop therunning jobs
+                    exit(1)
+                if TM_SIGHUP:
+                    self.logger.debug('SCHED: SIGHUP')
+                    self.sync_bootstrap_options()
+                    TM_SIGHUP = False
 
                 # reinit select timeout value
                 t = timeout
@@ -472,6 +553,14 @@ class Scheduler(object):
             t = Task(id=message.content['task_id'],
                      status=TASK_STATUS_CANCELED)
             self.task_queue.put(t)
+        elif message.type == MSG_TYPE_CONTEXT:
+            # context update
+            if type(message.content) == dict:
+                for k, v in message.content.items():
+                    self.set_context(k, v)
+                return Message(MSG_TYPE_RESP, self.get_context())
+            else:
+                return Message(MSG_TYPE_ERROR, 'Unvalid type')
 
         # TODO: handle other message types
 
