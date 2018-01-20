@@ -365,7 +365,11 @@ class Scheduler(object):
                 for t in func:
                     if isinstance(t, Task):
                         try:
-                            self.task_list.update(t.id, options=t.options)
+                            self.task_list.update(
+                                    t.id,
+                                    options=t.options,
+                                    redo_interval=t.redo_interval,
+                            )
                         except Exception as e:
                             self.logger.error('SCHED: Could not update task '
                                               % t.id)
