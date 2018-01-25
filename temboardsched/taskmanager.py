@@ -46,6 +46,8 @@ TASK_STATUS_CANCELED = 64
 TASK_STATUS_ABORTED = 128
 TASK_STATUS_ABORT = 256
 
+logger = logging.getLogger(__name__)
+
 
 def json_serial_datetime(obj):
     # JSON serializer for datetime
@@ -171,11 +173,9 @@ class TaskList(object):
                     )
                 except TypeError:
                     # Could not serialize Task to JSON
-                    logger = logging.getLogger()
                     logger.error("Could not serialize Task to JSON")
                     logger.debug(t)
                 except Exception as e:
-                    logger = logging.getLogger()
                     logger.exception(e)
 
     def recover(self):
@@ -184,8 +184,6 @@ class TaskList(object):
 
         if not os.path.exists(self.path):
             return
-
-        logger = logging.getLogger()
 
         with open(self.path, 'r') as f:
             for l in f.readlines():
@@ -213,6 +211,10 @@ class TaskList(object):
                         # running the last time task list was synced.
                         t.status = TASK_STATUS_ABORTED
                         t.stop_datetime = datetime.utcnow()
+
+                    if t.status & TASK_STATUS_SCHEDULED:
+                        # reset status to default
+                        t.status = TASK_STATUS_DEFAULT
 
                     logger.debug("SCHED: Recovered Task=%s" % t)
                     self.push(t)
@@ -271,19 +273,19 @@ class TaskManager(object):
                  authkey=None):
 
         self.scheduler = Scheduler(address, task_path, authkey)
-        self.worker_pool = WorkerPool(
-                                self.scheduler.task_queue,
-                                self.scheduler.event_queue,
-                           )
-        self.scheduler.logger = logging.getLogger()
-        self.worker_pool.logger = logging.getLogger()
 
     def set_context(self, key, val):
         self.scheduler.set_context(key, val)
 
     def start(self):
         self.scheduler.start()
-        self.worker_pool.start()
+
+    def join(self):
+        try:
+            self.scheduler.process.join()
+        except KeyboardInterrupt:
+            logger.debug("TASKM: KeyboardInterrupt catched.")
+            return
 
     @staticmethod
     def send_message(address, message, authkey=''):
@@ -301,13 +303,13 @@ class Scheduler(object):
         self.process = None
         # Listener for TM -> Scheduler IPC
         self.listener = Listener(address, authkey=authkey)
-        self.logger = None
         # Queue used to send Task orders (start, stop) to WorkerPool
         self.task_queue = Queue()
         # Queue used to notify Scheduler about Task status
         self.event_queue = Queue()
         self.task_list = TaskList(task_path)
         self.context = dict()
+        self.worker_pool = WorkerPool(self.task_queue, self.event_queue)
 
     def set_context(self, key, val):
         self.context[key] = val
@@ -320,19 +322,19 @@ class Scheduler(object):
         try:
             conn = self.listener.accept()
         except AuthenticationError:
-            self.logger.debug("SCHED: authent. error")
+            logger.debug("SCHED: authent. error")
             return
 
         try:
             message = conn.recv()
         except Exception as e:
             conn.close()
-            self.logger.error("SCHED: Unable to read the message")
-            self.logger.exception(e)
+            logger.error("SCHED: Unable to read the message")
+            logger.exception(e)
             return
 
         message.type = message.type[0]
-        self.logger.debug("SCHED: received Message=%s" % message)
+        logger.debug("SCHED: received Message=%s" % message)
 
         # handle incoming message and return a response
         res = self.handle_message(message)
@@ -345,11 +347,11 @@ class Scheduler(object):
             message = self.event_queue.get(False)
         except Empty:
             # should not happen
-            self.logger.debug("SCHED: event queue empty")
+            logger.debug("SCHED: event queue empty")
             return
 
         message.type = message.type[0]
-        self.logger.debug("SCHED: received Message=%s" % message)
+        logger.debug("SCHED: received Message=%s" % message)
 
         # handle incoming message
         self.handle_message(message)
@@ -371,16 +373,14 @@ class Scheduler(object):
                                     redo_interval=t.redo_interval,
                             )
                         except Exception as e:
-                            self.logger.error('SCHED: Could not update task '
-                                              % t.id)
-                            self.logger.exception(e)
+                            logger.error("SCHED: Could not update task" % t.id)
+                            logger.exception(e)
                     else:
-                        self.logger.error('SCHED: bootstrap task not a Task '
-                                          'instance.')
+                        logger.error("SCHED: bootstrap task not a Task"
+                                     " instance")
             else:
-                self.logger.error('SCHED: bootstrap function %s.%s not a '
-                                  'generator.'
-                                  % (bs_func['module'], bs_func['function']))
+                logger.error("SCHED: bootstrap function %s.%s not a generator"
+                             % (bs_func['module'], bs_func['function']))
 
     def bootstrap(self):
         # Load Tasks from generators decorated by @taskmanager.bootstrap()
@@ -392,18 +392,17 @@ class Scheduler(object):
                     if isinstance(t, Task):
                         try:
                             self.task_list.push(t)
-                            self.logger.info('SCHED: Loaded bootstrap Task=%s'
-                                             % t)
+                            logger.info("SCHED: Loaded bootstrap Task=%s" % t)
                         except KeyError:
-                            self.logger.error('SCHED: Task id=%s already '
-                                              'exists.' % t.id)
+                            logger.debug("SCHED: Task id=%s update options"
+                                         % t.id)
+                            self.task_list.update(t.id, options=t.options)
                     else:
-                        self.logger.error('SCHED: bootstrap task not a Task '
-                                          'instance.')
+                        logger.error("SCHED: bootstrap task not a Task"
+                                     " instance")
             else:
-                self.logger.error('SCHED: bootstrap function %s.%s not a '
-                                  'generator.'
-                                  % (bs_func['module'], bs_func['function']))
+                logger.error("SCHED: bootstrap function %s.%s not a generator"
+                             % (bs_func['module'], bs_func['function']))
 
     def run(self):
         # Add signal handler
@@ -414,6 +413,8 @@ class Scheduler(object):
         self.task_list.recover()
         # bootstrap
         self.bootstrap()
+        # TODO
+        # self.sync_bootstrap_options()
 
         global TM_SIGHUP
 
@@ -422,46 +423,58 @@ class Scheduler(object):
         date_end = float(time.time()) + timeout
         while True:
             # scheduler main loop
+            try:
+                logger.debug("SCHED: select on Listener with t=%s" % t)
 
-            self.logger.debug("SCHED: select on Listener with t=%s" % t)
+                # wait for I/O on Listener and event Queue
+                (fds, _, _) = select(
+                                [self.listener._listener._socket.fileno(),
+                                 self.event_queue._reader.fileno()],
+                                [], [], t)
+                if len(fds) > 0:
 
-            # wait for I/O on Listener and event Queue
-            (fds, _, _) = select([self.listener._listener._socket.fileno(),
-                                  self.event_queue._reader.fileno()],
-                                 [], [], t)
-            if len(fds) > 0:
+                    for fd in fds:
+                        if fd == self.listener._listener._socket.fileno():
+                            self.handle_listener_message()
+                        elif fd == self.event_queue._reader.fileno():
+                            self.handle_event_queue_message()
 
-                for fd in fds:
-                    if fd == self.listener._listener._socket.fileno():
-                        self.handle_listener_message()
-                    elif fd == self.event_queue._reader.fileno():
-                        self.handle_event_queue_message()
+                    # we need to change select timeout value
+                    logger.debug("SCHED: date_end=%s, float(time.time())=%s"
+                                 % (date_end, float(time.time())))
+                    t = date_end - float(time.time())
+                    if t < 0:
+                        t = timeout
+                        date_end = float(time.time()) + timeout
+                else:
+                    # we are here every 1 second
+                    logger.debug("SCHED: schedule")
+                    # schedule Tasks & maintain Tasks list
+                    self.schedule()
 
-                # we need to change select timeout value
-                self.logger.debug("SCHED: date_end=%s, float(time.time())=%s"
-                                  % (date_end, float(time.time())))
-                t = date_end - float(time.time())
-                if t < 0:
+                    if TM_SIGTERM:
+                        logger.debug("SCHED: SIGTERM")
+                        # TODO: Ask WP to stop therunning jobs
+                        self.stop()
+                        os._exit(1)
+                    if TM_SIGHUP:
+                        logger.debug("SCHED: SIGHUP")
+                        self.sync_bootstrap_options()
+                        TM_SIGHUP = False
+                    try:
+                        # Check parent
+                        os.kill(os.getppid(), 0)
+                    except Exception:
+                        self.stop()
+                        os._exit(1)
+
+                    # reinit select timeout value
                     t = timeout
                     date_end = float(time.time()) + timeout
-            else:
-                # we are here every 1 second
-                self.logger.debug('SCHED: schedule')
-                # schedule Tasks & maintain Tasks list
-                self.schedule()
-
-                if TM_SIGTERM:
-                    self.logger.debug('SCHED: SIGTERM')
-                    # TODO: Ask WP to stop therunning jobs
-                    exit(1)
-                if TM_SIGHUP:
-                    self.logger.debug('SCHED: SIGHUP')
-                    self.sync_bootstrap_options()
-                    TM_SIGHUP = False
-
-                # reinit select timeout value
-                t = timeout
-                date_end = float(time.time()) + timeout
+            except KeyboardInterrupt:
+                logger.debug("SCHED: KeyboardInterrupt catched, terminating.")
+                self.stop()
+                break
 
     def schedule(self):
         now = datetime.utcnow()
@@ -475,8 +488,7 @@ class Scheduler(object):
                 # new task
                 t.status = TASK_STATUS_SCHEDULED
                 self.task_list.tasks[task_id] = t
-                self.logger.debug('SCHED: Pushing to WorkerPool Task=%s'
-                                  % t)
+                logger.debug("SCHED: Pushing to WorkerPool Task=%s" % t)
                 self.task_queue.put(t, False)
                 continue
 
@@ -499,7 +511,7 @@ class Scheduler(object):
                     t.status & (TASK_STATUS_DONE | TASK_STATUS_FAILED |
                                 TASK_STATUS_ABORTED |
                                 TASK_STATUS_CANCELED)):
-                self.logger.debug('SCHED: Task to remove Task=%s' % (t))
+                logger.debug("SCHED: Task to remove Task=%s" % t)
                 # remove old tasks
                 remove_list.append(t.id)
                 continue
@@ -569,19 +581,30 @@ class Scheduler(object):
         # TODO: handle other message types
 
     def start(self):
+        self.worker_pool.start()
         self.process = Process(target=self.run, args=())
         self.process.start()
 
     def stop(self):
-        self.process.terminate()
-        self.process.join()
+        logger.debug("SCHED: aborting worker_pool")
+        self.worker_pool.stop()
+        logger.debug("SCHED: closing listener")
+        self.listener.close()
+        logger.debug("SCHED: closing task_queue")
+        self.task_queue.close()
+        logger.debug("SCHED: closing event_queue")
+        self.event_queue.close()
+        try:
+            if os.path.exists(TM_DEF_LISTENER_ADDR):
+                os.unlink(TM_DEF_LISTENER_ADDR)
+        except Exception:
+            pass
 
 
 class WorkerPool(object):
 
     def __init__(self, task_queue, event_queue):
         self.thread = None
-        self.logger = None
         self.task_queue = task_queue
         self.event_queue = event_queue
         self.workers = {}
@@ -599,8 +622,8 @@ class WorkerPool(object):
         for workername in self.workers:
             for job in self.workers[workername]['pool']:
                 if job['id'] == task_id:
-                    self.logger.debug("WORKP: process pid=%s is going to be "
-                                      "killed." % job['process'])
+                    logger.debug("WORKP: process pid=%s is going to be killed"
+                                 % job['process'])
                     job['process'].terminate()
                     return True
         return False
@@ -610,8 +633,7 @@ class WorkerPool(object):
             for t in self.workers[workername]['queue']:
                 if t.id == task_id:
                     self.workers[workername]['queue'].remove(t)
-                    self.logger.debug("WORKP: Task id=%s removed from queue."
-                                      % t.id)
+                    logger.debug("WORKP: Task id=%s removed from queue" % t.id)
                     return True
         return False
 
@@ -619,9 +641,9 @@ class WorkerPool(object):
         while True:
             try:
                 t = self.task_queue.get(timeout=0.1)
-                self.logger.debug("WORKP: Task=%s" % t)
+                logger.debug("WORKP: Task=%s" % t)
                 if t.status & TASK_STATUS_SCHEDULED:
-                    self.logger.debug("WORKP: add task to queue")
+                    logger.debug("WORKP: add task to queue")
                     self.workers[t.worker_name]['queue'].appendleft(t)
                     # Update task status
                     self.event_queue.put(
@@ -649,7 +671,7 @@ class WorkerPool(object):
             except Empty:
                 pass
             except Exception as e:
-                self.logger.exception(e)
+                logger.exception(e)
             # check running jobs state
             self.check_jobs()
             # start new jobs
@@ -663,7 +685,9 @@ class WorkerPool(object):
             out.put(Message(MSG_TYPE_RESP, res))
         except Exception as e:
             out.put(Message(MSG_TYPE_ERROR, e))
-            self.logger.exception(e)
+            logger.exception(e)
+        except KeyboardInterrupt:
+            logger.debug("WORKP: KeyboardInterrupt catched")
 
     def start_jobs(self):
         # Execute Tasks
@@ -671,8 +695,8 @@ class WorkerPool(object):
             while len(self.workers[name]['pool']) < worker['pool_size']:
                 try:
                     t = worker['queue'].pop()
-                    self.logger.debug("WORKP: start new worker %s.%s"
-                                      % (worker['module'], worker['function']))
+                    logger.debug("WORKP: start new worker %s.%s"
+                                 % (worker['module'], worker['function']))
                     # Queue used to get worker function return
                     out = Queue()
                     p = Process(
@@ -703,14 +727,13 @@ class WorkerPool(object):
             for job in worker['pool']:
                 if not job['process'].is_alive():
                     # Dead process case
-                    self.logger.debug("WORKP: Job id=%s is dead" % job['id'])
+                    logger.debug("WORKP: Job id=%s is dead" % job['id'])
                     try:
                         # Fetch the message from job's output queue
                         message_out = job['out'].get(False)
                     except Empty:
                         message_out = None
-                    self.logger.debug("WORKP: Job output Message=%s"
-                                      % message_out)
+                    logger.debug("WORKP: Job output Message=%s" % message_out)
                     # Close job's output queue
                     job['out'].close()
                     # join the process
@@ -757,4 +780,19 @@ class WorkerPool(object):
         self.thread.start()
 
     def stop(self):
-        self.thread.join()
+        self.abort_jobs()
+
+    def abort_jobs(self):
+        # abort all running jobs
+        for name, worker in self.workers.items():
+            for job in worker['pool']:
+                process = job.get('process')
+                if process.is_alive():
+                    process.terminate()
+                    logger.debug("WORKP: Job id=%s has been terminated"
+                                 % job['id'])
+                    # Close job's output queue
+                    job['out'].close()
+                    # join the process
+                    process.join()
+                    self.workers[name]['pool'].remove(job)
