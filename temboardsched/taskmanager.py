@@ -593,8 +593,8 @@ class Scheduler(object):
         logger.debug("Closing event_queue")
         self.event_queue.close()
         try:
-            if os.path.exists(TM_DEF_LISTENER_ADDR):
-                os.unlink(TM_DEF_LISTENER_ADDR)
+            if os.path.exists(self.listener.address):
+                os.unlink(self.listener.address)
         except Exception:
             pass
 
