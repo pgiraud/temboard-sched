@@ -11,7 +11,6 @@ from datetime import datetime, timedelta
 from collections import deque
 from multiprocessing import Process, Queue
 from multiprocessing.connection import Listener, Client, AuthenticationError
-from threading import Thread
 
 try:
     from Queue import Empty
@@ -283,9 +282,11 @@ class TaskManager(object):
 
     def join(self):
         try:
-            self.scheduler.process.join()
+            logger.debug("Joining scheduler process")
+            self.scheduler.process.terminate()
+            self.scheduler.process.join(1)
         except KeyboardInterrupt:
-            logger.debug("KeyboardInterrupt catched")
+            logger.debug("KeyboardInterrupt")
             return
 
     @staticmethod
@@ -454,7 +455,7 @@ class Scheduler(object):
                         logger.debug("SIGTERM received")
                         # TODO: Ask WP to stop therunning jobs
                         self.stop()
-                        os._exit(1)
+                        return
                     if TM_SIGHUP:
                         logger.debug("SIGHUP received")
                         self.sync_bootstrap_options()
@@ -464,15 +465,15 @@ class Scheduler(object):
                         os.kill(os.getppid(), 0)
                     except Exception:
                         self.stop()
-                        os._exit(1)
+                        return
 
                     # reinit select timeout value
                     t = timeout
                     date_end = float(time.time()) + timeout
             except KeyboardInterrupt:
-                logger.error("KeyboardInterrupt catched, terminating.")
+                logger.error("KeyboardInterrupt")
                 self.stop()
-                break
+                return
 
     def schedule(self):
         now = datetime.utcnow()
@@ -592,11 +593,6 @@ class Scheduler(object):
         self.task_queue.close()
         logger.debug("Closing event_queue")
         self.event_queue.close()
-        try:
-            if os.path.exists(self.listener.address):
-                os.unlink(self.listener.address)
-        except Exception:
-            pass
 
 
 class WorkerPool(object):
@@ -670,6 +666,10 @@ class WorkerPool(object):
                 pass
             except Exception as e:
                 logger.exception(e)
+            except KeyboardInterrupt:
+                logger.error("KeyboardInterrupt")
+                return
+
             # check running jobs state
             self.check_jobs()
             # start new jobs
@@ -685,7 +685,7 @@ class WorkerPool(object):
             out.put(Message(MSG_TYPE_ERROR, e))
             logger.exception(e)
         except KeyboardInterrupt:
-            logger.error("KeyboardInterrupt catched")
+            logger.error("KeyboardInterrupt")
 
     def start_jobs(self):
         # Execute Tasks
@@ -774,8 +774,8 @@ class WorkerPool(object):
                     self.workers[name]['pool'].remove(job)
 
     def start(self):
-        self.thread = Thread(target=self.run, args=())
-        self.thread.start()
+        self.Process = Process(target=self.run, args=())
+        self.Process.start()
 
     def stop(self):
         self.abort_jobs()
