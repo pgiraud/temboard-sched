@@ -10,8 +10,22 @@ SETUP_KWARGS = dict(
     version=__version__,
     author='Julien Tachoires',
     author_email='julmon@gmail.com',
-    license='PostgreSQL',
-    description='Task scheduler for temboard.',
+    license='BSD',
+    description='Task scheduler for temBoard.',
+    url='https://github.com/dalibo/temboard-sched',
+    classifiers=[
+        'Development Status :: 3 - Alpha',
+        'Intended Audience :: Developers',
+        'Topic :: Software Development :: Build Tools',
+        'License :: OSI Approved :: BSD License',
+        'Programming Language :: Python :: 2',
+        'Programming Language :: Python :: 2.7',
+        'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.2',
+        'Programming Language :: Python :: 3.3',
+        'Programming Language :: Python :: 3.4',
+        'Operating System :: POSIX :: Linux',
+    ],
 )
 
 if __name__ == '__main__':
