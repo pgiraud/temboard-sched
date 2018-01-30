@@ -1,0 +1,41 @@
+version: 2
+
+.lint_tpl: &lint_tpl
+  working_directory: ~/workspace
+  steps:
+  - checkout
+  - restore_cache:
+      keys:
+        - temboard-sched-lint
+  - run:
+      name: Setup python environment
+      command: |
+        sudo pip install wheel virtualenv
+        virtualenv .venv/
+        . .venv/bin/activate
+        pip install --upgrade --requirement requirements-ci.txt --editable .
+  - run:
+      name: Lint
+      command: |
+        . .venv/bin/activate
+        flake8 temboardsched setup.py
+  - save_cache:
+      key: temboard-sched-lint-{{ epoch }}
+      paths:
+      - ".venv"
+
+jobs:
+  0-lint-py27:
+    <<: *lint_tpl
+    docker: [{image: "circleci/python:2.7"}]
+
+  0-lint-py34:
+    <<: *lint_tpl
+    docker: [{image: "circleci/python:3.4"}]
+
+workflows:
+  version: 2
+  pipeline:
+    jobs:
+    - 0-lint-py27
+    - 0-lint-py34

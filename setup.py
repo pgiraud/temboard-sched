@@ -3,11 +3,11 @@ import os
 
 # Load version number
 setup_path = os.path.dirname(os.path.realpath(__file__))
-exec(open(os.path.join(setup_path,'temboardsched','version.py')).read())
+exec(open(os.path.join(setup_path, 'temboardsched', 'version.py')).read())
 
 SETUP_KWARGS = dict(
     name='temboard-sched',
-    version=__version__,
+    version=__version__,  # noqa
     author='Julien Tachoires',
     author_email='julmon@gmail.com',
     license='BSD',

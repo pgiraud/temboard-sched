@@ -14,7 +14,7 @@ from multiprocessing.connection import Listener, Client, AuthenticationError
 
 try:
     from Queue import Empty
-except ModuleNotFoundError:
+except ImportError:
     from queue import Empty
 
 TM_WORKERS = []
